@@ -2,7 +2,7 @@
 
 <p align="center">
 
-  <h1 align="center">COLMAP-Free 3D Gaussian Splatting</h1>
+  <h1 align="center">Reproject 3D Gaussian Splatting</h1>
   <p align="center">
     <a href="https://oasisyang.github.io/"><strong>Yang Fu</strong></a>
     ·
