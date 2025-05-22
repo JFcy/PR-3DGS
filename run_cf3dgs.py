@@ -16,6 +16,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 import torch
 import pdb
 from datetime import datetime
+import wandb
 
 
 def contruct_pose(poses):
@@ -29,6 +30,7 @@ def contruct_pose(poses):
 
 
 if __name__ == "__main__":
+    
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -41,6 +43,10 @@ if __name__ == "__main__":
     # hydrant/106_12648_23157
     # teddybear/34_1403_4393
     data_path = model_cfg.source_path
+    wandb.init(
+        project="RP3DGS",  # 项目名称（会在 W&B 网页端创建）
+        name="test img record",          # 实验名称（可选）
+    )
     trainer = CFGaussianTrainer(data_path, model_cfg, pipe_cfg, optim_cfg)
     start_time = datetime.now()
     if model_cfg.mode == "train":
@@ -52,4 +58,6 @@ if __name__ == "__main__":
     elif model_cfg.mode == "eval_pose":
         trainer.eval_pose()
     end_time = datetime.now()
+    wandb.finish()
     print('Duration: {}'.format(end_time - start_time))
+

@@ -50,6 +50,7 @@ from .losses import Loss, compute_scale_and_shift
 from copy import copy
 from utils.vis_utils import interp_poses_bspline, generate_spiral_nerf, plot_pose
 
+import wandb
 
 def contruct_pose(poses):
     n_trgt = poses.shape[0]
@@ -77,6 +78,10 @@ class CFGaussianTrainer(GaussianTrainer):
 
     def setup_losses(self):
         self.loss_func = Loss(self.optim_cfg)
+
+    def setup_losses_v2(self,viewpoint_cam,viewpoint_cam_ref):
+        self.loss_func = Loss(self.optim_cfg,viewpoint_cam,viewpoint_cam_ref)
+    
 
     def train_step(self,
                    gs_render,
@@ -125,20 +130,116 @@ class CFGaussianTrainer(GaussianTrainer):
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         loss_dict = self.compute_loss(render_pkg, viewpoint_cam,
-                                      pipe, iteration,
+                                      pipe, iteration,None,
                                       use_reproject, use_matcher,
                                       ref_fidx, **kwargs)
+        img_render = image.detach().clone().permute(1, 2, 0).cpu().numpy() * 255.0
+        img_gt = gt_image.detach().clone().permute(1, 2, 0).cpu().numpy() * 255.0
 
         loss = loss_dict['loss']
         loss.backward()
 
         with torch.no_grad():
-            # Progress bar
-            # try:
-            #     self.ema_loss_for_log = 0.4 * loss.item() + 0.6 * self.ema_loss_for_log
-            # except:
-            #     pdb.set_trace()
-            # mask = visibility_filter.reshape(gt_image.shape[1:])[None]
+            psnr_train = psnr(image, gt_image).mean().double()
+            self.just_reset = False
+            if iteration < optim_opt.densify_until_iter and densify:
+                # Keep track of max radii in image-space for pruning
+                try:
+                    gs_render.gaussians.max_radii2D[visibility_filter] = torch.max(gs_render.gaussians.max_radii2D[visibility_filter],
+                                                                                   radii[visibility_filter])
+                except:
+                    pdb.set_trace()
+                gs_render.gaussians.add_densification_stats(
+                    viewspace_point_tensor, visibility_filter)
+
+                if iteration > optim_opt.densify_from_iter and iteration % optim_opt.densification_interval == 0:
+                    size_threshold = 20 if iteration > optim_opt.opacity_reset_interval else None
+                    self.gs_render.gaussians.densify_and_prune(optim_opt.densify_grad_threshold, 0.005,
+                                                               gs_render.radius, size_threshold)
+
+                if iteration % optim_opt.opacity_reset_interval == 0 and reset and iteration < optim_opt.reset_until_iter:
+                    gs_render.gaussians.reset_opacity()
+                    self.just_reset = True
+
+            if update_gaussians:
+                gs_render.gaussians.optimizer.step()
+                gs_render.gaussians.optimizer.zero_grad(set_to_none=True)
+            if getattr(gs_render.gaussians, "camera_optimizer", None) is not None and update_cam:
+                current_fidx = gs_render.gaussians.seq_idx
+                gs_render.gaussians.camera_optimizer[current_fidx].step()
+                gs_render.gaussians.camera_optimizer[current_fidx].zero_grad(
+                    set_to_none=True)
+
+
+        return loss_dict, render_pkg, psnr_train
+
+    def train_step_v2(self,
+                   gs_render,
+                   viewpoint_cam,
+                   viewpoint_cam_ref,
+                   iteration,
+                   pipe,
+                   optim_opt,
+                   colors_precomp=None,
+                   update_gaussians=True,
+                   update_cam=True,
+                   update_distort=False,
+                   densify=True,
+                   prev_gaussians=None,
+                   use_reproject=False,
+                   use_matcher=False,
+                   ref_fidx=None,
+                   reset=True,
+                   reproj_loss=None,
+                   **kwargs,
+                   ):
+        # Render
+        render_pkg = gs_render.render(
+            viewpoint_cam,
+            compute_cov3D_python=pipe.compute_cov3D_python,
+            convert_SHs_python=pipe.convert_SHs_python,
+            override_color=colors_precomp)
+
+        if prev_gaussians is not None:
+            with torch.no_grad():
+                # Render
+                render_pkg_prev = prev_gaussians.render(
+                    viewpoint_cam,
+                    compute_cov3D_python=pipe.compute_cov3D_python,
+                    convert_SHs_python=pipe.convert_SHs_python,
+                    override_color=colors_precomp)
+            mask = (render_pkg["alpha"] > 0.5).float()
+            render_pkg["image"] = render_pkg["image"] * \
+                mask + render_pkg_prev["image"] * (1 - mask)
+            render_pkg["depth"] = render_pkg["depth"] * \
+                mask + render_pkg_prev["depth"] * (1 - mask)
+
+        image, viewspace_point_tensor, visibility_filter, radii = (render_pkg["image"],
+                                                                   render_pkg["viewspace_points"],
+                                                                   render_pkg["visibility_filter"],
+                                                                   render_pkg["radii"])
+        # Loss
+        gt_image = viewpoint_cam.original_image.cuda()
+        loss_dict = self.compute_loss(render_dict = render_pkg, viewpoint_cam = viewpoint_cam,
+                                      pipe_opt = pipe, iteration = iteration,viewpoint_cam_ref = viewpoint_cam_ref,
+                                      use_reproject = use_reproject, use_matcher = use_matcher,
+                                      ref_fidx = ref_fidx, **kwargs)
+        img_render = image.detach().clone().permute(1, 2, 0).cpu().numpy() * 255.0
+        img_gt = gt_image.detach().clone().permute(1, 2, 0).cpu().numpy() * 255.0
+
+        wandb.log(
+            {
+                "comparison": [
+                    wandb.Image(img_render, caption="Rendered"),
+                    wandb.Image(img_gt, caption="Ground Truth"),
+                    ]
+            }
+        )
+
+        loss = loss_dict['loss']
+        loss.backward()
+
+        with torch.no_grad():
             psnr_train = psnr(image, gt_image).mean().double()
             self.just_reset = False
             if iteration < optim_opt.densify_until_iter and densify:
@@ -175,9 +276,7 @@ class CFGaussianTrainer(GaussianTrainer):
     def init_two_view(self, view_idx_1, view_idx_2, pipe, optim_opt):
         # prepare data
         self.loss_func.depth_loss_type = "invariant"
-        cam_info, pcd, viewpoint_cam = self.prepare_data(view_idx_1,
-                                                         orthogonal=True,
-                                                         down_sample=True)
+        cam_info, pcd, viewpoint_cam = self.prepare_data(view_idx_1,orthogonal=True,down_sample=True)
         radius = np.linalg.norm(pcd.points, axis=1).max()
 
         # Initialize gaussians
@@ -222,19 +321,15 @@ class CFGaussianTrainer(GaussianTrainer):
         pipe = copy(self.pipe_cfg)
         optim_opt = copy(self.optim_cfg)
         # prepare data
-        cam_info, pcd, viewpoint_cam = self.prepare_data(view_idx_prev,
-                                                         orthogonal=True,
-                                                         down_sample=True)
+        cam_info, pcd, viewpoint_cam = self.prepare_data(view_idx_prev,orthogonal=True,down_sample=True)
         radius = np.linalg.norm(pcd.points, axis=1).max()
         self.gs_render_local.reset_model()
         self.gs_render_local.init_model(pcd)
         # Fit current gaussian
         optim_opt.iterations = 1000
         optim_opt.densify_from_iter = optim_opt.iterations + 1
-        progress_bar = tqdm(range(optim_opt.iterations),
-                            desc="Training progress")
-        self.gs_render_local.gaussians.training_setup(
-            optim_opt, fix_pos=True,)
+        progress_bar = tqdm(range(optim_opt.iterations),desc="Training progress")
+        self.gs_render_local.gaussians.training_setup(optim_opt, fix_pos=True,)
         for iteration in range(1, optim_opt.iterations+1):
             # Update learning rate
             self.gs_render_local.gaussians.update_learning_rate(iteration)
@@ -252,28 +347,33 @@ class CFGaussianTrainer(GaussianTrainer):
                 break
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"PSNR": f"{psnr_train:.{2}f}",
-                                          "Number points": f"{self.gs_render.gaussians.get_xyz.shape[0]}"})
+                progress_bar.set_postfix({"PSNR": f"{psnr_train:.{2}f}","Number points": f"{self.gs_render.gaussians.get_xyz.shape[0]}"})
                 progress_bar.update(10)
             if iteration == optim_opt.iterations:
                 progress_bar.close()
 
         print(f"optimizing frame {view_idx:03d}")
-        viewpoint_cam_ref = self.load_viewpoint_cam(view_idx,
-                                                    load_depth=True)
+        viewpoint_cam_ref = self.load_viewpoint_cam(view_idx, load_depth=True)
         optim_opt.iterations = 300
         optim_opt.densify_from_iter = optim_opt.iterations + 1
         self.gs_render_local.gaussians.init_RT(None)
-        self.gs_render_local.gaussians.training_setup_fix_position(
-            optim_opt, gaussian_rot=False)
+        self.gs_render_local.gaussians.training_setup_fix_position(optim_opt, gaussian_rot=False)
 
-        progress_bar = tqdm(range(optim_opt.iterations),
-                            desc="Training progress")
+        progress_bar = tqdm(range(optim_opt.iterations),desc="Training progress")
         for iteration in range(1, optim_opt.iterations+1):
             # Update learning rate
             self.gs_render_local.gaussians.update_learning_rate(iteration)
-            loss, rend_dict_ref, psnr_train = self.train_step(self.gs_render_local,
-                                                              viewpoint_cam_ref, iteration,
+            ## version 1.0
+            # loss, rend_dict_ref, psnr_train = self.train_step(self.gs_render_local,
+            #                                                   viewpoint_cam_ref, iteration,
+            #                                                   pipe, optim_opt,
+            #                                                   densify=False,
+            #                                                   )
+            # version 2.0
+            loss, rend_dict_ref, psnr_train = self.train_step_v2(self.gs_render_local,
+                                                              viewpoint_cam,
+                                                              viewpoint_cam_ref,
+                                                              iteration,
                                                               pipe, optim_opt,
                                                               densify=False,
                                                               )
@@ -284,16 +384,13 @@ class CFGaussianTrainer(GaussianTrainer):
             if iteration == optim_opt.iterations:
                 progress_bar.close()
 
-        # self.visualize(rend_dict_ref, "vis/render_optim.png",
-        #                gt_image=viewpoint_cam_ref.original_image.cuda(),
-        #                gt_depth=self.mono_depth[view_idx_prev])
+    
         local_model_params = self.gs_render_local.gaussians.capture()
 
         # pcd under view_idx_prev frame
         pcd = self.gs_render_local.gaussians._xyz.detach()
         rel_pose = self.gs_render_local.gaussians.get_RT().detach()
-        pose = rel_pose @ self.gs_render.gaussians.get_RT(
-            view_idx_prev).detach()
+        pose = rel_pose @ self.gs_render.gaussians.get_RT( view_idx_prev).detach()
         self.gs_render.gaussians.update_RT_seq(pose, view_idx)
 
         self.gs_render.gaussians.rotate_seq = False
@@ -405,7 +502,6 @@ class CFGaussianTrainer(GaussianTrainer):
         self.optim_cfg.densify_from_iter = 1000
         self.optim_cfg.densify_from_iter = self.single_step
 
-
         if pipe.expname == "":
             expname = "progressive"
         else:
@@ -436,28 +532,23 @@ class CFGaussianTrainer(GaussianTrainer):
         start_frame = 1
         end_frame = max_frame
 
-
-
         os.makedirs(f"{result_path}/pose", exist_ok=True)
         os.makedirs(f"{result_path}/mesh", exist_ok=True)
 
         num_eppch = 1
         reverse = False
         for epoch in range(num_eppch):
-            gauss_params = self.init_two_view(
-                0, end_frame, pipe, copy(self.optim_cfg))
+            gauss_params = self.init_two_view(0, end_frame, pipe, copy(self.optim_cfg))
             
             self.global_iteration = 0
             optim_opt = copy(self.optim_cfg)
             self.gs_render.gaussians.rotate_seq = True
-            self.gs_render.gaussians.training_setup(self.optim_cfg,
-                                                    fit_pose=True,)
+            self.gs_render.gaussians.training_setup(self.optim_cfg,fit_pose=True,)
             self.match_results = OrderedDict()
             for fidx in range(start_frame, end_frame):
                 # pcd_new, local_gauss_params = self.add_view(
                 #     None, fidx, fidx-1, pipe, optim_opt, reverse=reverse)
-                pcd_new, local_gauss_params = self.add_view_v2(
-                    fidx, fidx-1)
+                pcd_new, local_gauss_params = self.add_view_v2(fidx, fidx-1)
                 self.gs_render.gaussians.rotate_seq = False
                 viewpoint_cam = self.load_viewpoint_cam(fidx,
                                                         pose=self.gs_render.gaussians.get_RT(
@@ -771,6 +862,7 @@ class CFGaussianTrainer(GaussianTrainer):
                      viewpoint_cam,
                      pipe_opt,
                      iteration,
+                     viewpoint_cam_ref = None,
                      use_reproject=False,
                      use_matcher=False,
                      ref_fidx=None,
@@ -784,9 +876,13 @@ class CFGaussianTrainer(GaussianTrainer):
             depth[depth < self.near] = self.near
             fidx = viewpoint_cam.uid
             kwargs['depth_pred'] = depth
-
-        loss_dict = self.loss_func(image, gt_image, **kwargs)
+        if viewpoint_cam_ref == None:
+            loss_dict = self.loss_func(image, gt_image, **kwargs)
+        else :
+            use_reproject = iteration > 100
+            loss_dict = self.loss_func(image, gt_image, viewpoint_cam=viewpoint_cam,viewpoint_cam_ref=viewpoint_cam_ref,**kwargs)
         return loss_dict
+    
 
     def visualize(self, render_pkg, filename, gt_image=None, gt_depth=None, save_ply=False):
         os.makedirs(os.path.dirname(filename), exist_ok=True)

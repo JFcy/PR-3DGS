@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.autograd import Variable
-
+import cv2
 import numpy as np
 from math import exp
 
@@ -31,7 +31,7 @@ class Loss_Eval(nn.Module):
 
 
 class Loss(nn.Module):
-    def __init__(self, cfg=None):
+    def __init__(self, cfg=None,Rt=None,Rt_ref=None):
         super().__init__()
 
         self.depth_loss_type = cfg.depth_loss_type
@@ -40,7 +40,8 @@ class Loss(nn.Module):
         self.l2_loss = nn.MSELoss(reduction='sum')
         self.scale_inv_loss = ScaleAndShiftInvariantLoss(alpha=0.5,
                                                          scales=1)
-
+        self.Rt = Rt
+        self.Rt_ref = Rt_ref
         # ssim_loss = ssim
         self.ssim_loss = SSIM_V2()
 
@@ -93,10 +94,48 @@ class Loss(nn.Module):
             loss = self.scale_inv_loss(
                 depth_pred[None], depth_gt[None], mask[None])
         return loss
+    
+    def project(self, K, Rt, pts3D):
+        R = Rt[:3, :3]
+        T = Rt[:3, 3].reshape(3, 1)
+        pts_cam = (R @ pts3D.T) + T.reshape(3, 1)  # make T a column vector
+        pts_proj = K @ pts_cam
+        print("K contains nan:", np.isnan(K).any())
+        pts_proj /= pts_proj[2:]  # normalize to homogeneous
+        return pts_proj[:2].T  # return (N, 2)
 
+    def reproject_loss(self,viewpoint_cam,viewpoint_cam_ref,Rt,Rt_ref):
+        sift = cv2.SIFT_create()
+        img_pred = (viewpoint_cam.original_image.clone().permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        img_ref = (viewpoint_cam_ref.original_image.clone().permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        kp1, des1 = sift.detectAndCompute(img_pred, None)
+        kp2, des2 = sift.detectAndCompute(img_ref, None)
+        bf = cv2.BFMatcher()
+        matches = bf.knnMatch(des1, des2, k=2)
+        good = []
+        for m, n in matches:
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+        pts1 = np.float32([kp1[m.queryIdx].pt for m in good]) 
+        pts2 = np.float32([kp2[m.trainIdx].pt for m in good]) 
+        K = viewpoint_cam.intrinsics
+        # R1 = viewpoint_cam.R
+        # T1 = viewpoint_cam.T
+        # R2 = viewpoint_cam_ref.R
+        # T2 = viewpoint_cam_ref.T
+        # P1 = K @ np.hstack((R1, T1.reshape(3, 1)))
+        # P2 = K @ np.hstack((R2, T1.reshape(3, 1)))
+        P1 = K @ Rt
+        P2 = K @ Rt_ref
+        pts4D_h = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)  # shape: (4, N)
+        pts3D = (pts4D_h[:3] / pts4D_h[3]).T  # shape: (N, 3)
+        proj_pts2 = self.project(K, Rt_ref, pts3D)
+        reproj_error = np.linalg.norm(proj_pts2 - pts2, axis=1)
+        mean_error = np.mean(reproj_error)
+        return mean_error
 
-    def forward(self, rgb_pred, rgb_gt, depth_pred=None, depth_gt=None,
-                rgb_loss_type='l1', **kwargs):
+    def forward(self, rgb_pred, rgb_gt, depth_pred=None, depth_gt=None,viewpoint_cam=None,viewpoint_cam_ref=None,
+                rgb_loss_type='l1', use_reproject=False, **kwargs):
 
         rgb_gt = rgb_gt.cuda()
 
@@ -119,9 +158,15 @@ class Loss(nn.Module):
                 depth_pred.squeeze(), depth_gt.squeeze())
         else:
             depth_loss = torch.tensor(0.0).cuda().float()
-
+        
+        if viewpoint_cam != None and use_reproject:
+            reproject_loss = self.reproject_loss(viewpoint_cam,viewpoint_cam_ref)
+        else :
+            reproject_loss = 0
         loss = rgb_full_loss + lambda_dssim * dssim_loss +\
-            lambda_depth * depth_loss
+            lambda_depth * depth_loss + reproject_loss
+        
+        
 
         if torch.isnan(loss):
             breakpoint()

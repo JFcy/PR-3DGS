@@ -36,7 +36,7 @@ import json
 import gzip
 import torch
 import torch.nn.functional as F
-torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=True)
+# torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=True)
 
 
 class GaussianTrainer(object):
@@ -234,21 +234,9 @@ class GaussianTrainer(object):
             source_path = self.model_cfg.source_path
             cameras_intrinsic_file = os.path.join(source_path, "sparse/0", "cameras.bin")
             max_frames = 300
-            # if os.path.exists(cameras_intrinsic_file):
-            #     images = sorted(glob.glob(os.path.join(source_path, "images", "*.jpg")))
-            #     if len(images)>max_frames:
-            #         images = images[-max_frames:]
-            #     cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-            #     intr = cam_intrinsics[1]
-            #     focal_length_x = intr.params[0]
-            #     focal_length_y = intr.params[1]
-            #     height = intr.height
-            #     width = intr.width
-            #     intr_mat = np.array(
-            #         [[focal_length_x, 0, width/2], [0, focal_length_y, height/2], [0, 0, 1]])
-            #     self.intrinsic = intr_mat
-            # else:
-            images = sorted(glob.glob(os.path.join(source_path, "images/*.jpg")))
+            images = sorted(glob.glob(os.path.join(source_path, "*.jpg")))
+            if len(images) == 0:
+                images = sorted(glob.glob(os.path.join(source_path, "*.png")))
             if len(images) > max_frames:
                 interval = len(images) // max_frames
                 images = images[::interval]
